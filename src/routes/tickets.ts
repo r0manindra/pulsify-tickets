@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
+import crypto from 'node:crypto';
 import { eq, and } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { events, ticketTypes, orders, tickets, organizations } from '../db/schema.js';

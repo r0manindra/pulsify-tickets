@@ -1,13 +1,14 @@
 import type { Context } from 'hono';
-import { TitoApiError } from '../services/tito.js';
+import Stripe from 'stripe';
 
 export async function errorHandler(err: Error, c: Context) {
   console.error(`[Error] ${err.message}`, err.stack);
 
-  if (err instanceof TitoApiError) {
+  if (err instanceof Stripe.errors.StripeError) {
+    const status = err.statusCode ?? 500;
     return c.json(
-      { error: 'Tito API error', details: err.body, status: err.status },
-      err.status >= 500 ? 502 : err.status as 400,
+      { error: 'Stripe error', message: err.message, code: err.code },
+      status >= 500 ? 502 : (status as 400),
     );
   }
 

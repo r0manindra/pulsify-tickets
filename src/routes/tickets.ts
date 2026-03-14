@@ -4,7 +4,10 @@ import { eq, and } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { events, ticketTypes, orders, tickets, organizations } from '../db/schema.js';
 import { requireApiKey, requireJwt } from '../middleware/auth.js';
-import { TitoClient } from '../services/tito.js';
+import { createCheckoutSession } from '../services/stripe.js';
+import { generateQrPng } from '../services/qr.js';
+import { generateOrderReference, generateTicketReference } from '../services/references.js';
+import { config } from '../config.js';
 
 const app = new Hono();
 
@@ -14,16 +17,6 @@ const registerSchema = z.object({
   ticketTypeId: z.string().uuid(),
   quantity: z.number().int().positive().default(1),
 });
-
-async function getTitoClient(organizationId: string) {
-  const [org] = await db
-    .select()
-    .from(organizations)
-    .where(eq(organizations.id, organizationId))
-    .limit(1);
-  if (!org?.titoAccountSlug || !org?.titoApiToken) return null;
-  return new TitoClient(org.titoApiToken, org.titoAccountSlug);
-}
 
 // POST /events/:id/register — register/purchase tickets (JWT)
 app.post('/events/:id/register', requireJwt, async (c) => {
@@ -49,94 +42,106 @@ app.post('/events/:id/register', requireJwt, async (c) => {
     return c.json({ error: 'Not enough tickets available' }, 409);
   }
 
-  let titoRegistrationId: string | null = null;
-  let titoReference: string | null = null;
-  let checkoutUrl: string | null = null;
-  const titoTickets: Array<{ id: string; slug: string; reference: string }> = [];
+  const totalAmount = Number(tt.price) * parsed.data.quantity;
+  const isPaid = totalAmount > 0;
+  const orderRef = generateOrderReference();
 
-  const tito = await getTitoClient(event.organizationId);
-  if (tito && event.titoEventSlug && tt.titoReleaseSlug) {
-    const resp = await tito.createRegistration(event.titoEventSlug, {
-      name: parsed.data.name,
-      email: parsed.data.email,
-      line_items: [{ release_id: tt.titoReleaseId, quantity: parsed.data.quantity }],
-    });
+  // For paid tickets, check org has Stripe connected
+  let org = null;
+  if (isPaid) {
+    [org] = await db
+      .select()
+      .from(organizations)
+      .where(eq(organizations.id, event.organizationId))
+      .limit(1);
 
-    const reg = resp.registration as Record<string, unknown>;
-    titoRegistrationId = String(reg.id);
-    titoReference = reg.reference as string;
-
-    if (reg.receipt && typeof reg.receipt === 'object' && 'url' in (reg.receipt as Record<string, unknown>)) {
-      checkoutUrl = (reg.receipt as Record<string, unknown>).url as string;
-    }
-
-    if (Array.isArray(reg.tickets)) {
-      for (const t of reg.tickets as Array<Record<string, unknown>>) {
-        titoTickets.push({
-          id: String(t.id),
-          slug: t.slug as string,
-          reference: t.reference as string,
-        });
-      }
+    if (!org?.stripeConnectedAccountId || !org?.stripeOnboardingComplete) {
+      return c.json({ error: 'Organization has not completed payment setup' }, 400);
     }
   }
 
+  // Calculate platform fee
+  const platformFeeAmount = isPaid
+    ? Math.round(totalAmount * 100 * config.stripe.platformFeePercent / 100) // in cents
+    : 0;
+
+  // Create order
   const [order] = await db
     .insert(orders)
     .values({
       eventId,
       userId,
-      titoRegistrationId,
-      titoReference,
-      status: Number(tt.price) > 0 && checkoutUrl ? 'pending' : 'complete',
-      totalAmount: String(Number(tt.price) * parsed.data.quantity),
+      orderReference: orderRef,
+      status: isPaid ? 'pending' : 'complete',
+      totalAmount: String(totalAmount),
+      platformFeeAmount: isPaid ? String(platformFeeAmount / 100) : null,
       currency: tt.currency,
     })
     .returning();
 
+  // Create tickets
   const createdTickets = [];
-  if (titoTickets.length > 0) {
-    for (const t of titoTickets) {
-      const [ticket] = await db
-        .insert(tickets)
-        .values({
-          orderId: order.id,
-          eventId,
-          ticketTypeId: tt.id,
-          userId,
-          titoTicketId: t.id,
-          titoTicketSlug: t.slug,
-          titoReference: t.reference,
-          qrCodeUrl: `https://qr.tito.io/tickets/${t.slug}`,
-          name: parsed.data.name,
-          email: parsed.data.email,
-          status: 'active',
-        })
-        .returning();
-      createdTickets.push(ticket);
-    }
-  } else {
-    for (let i = 0; i < parsed.data.quantity; i++) {
-      const [ticket] = await db
-        .insert(tickets)
-        .values({
-          orderId: order.id,
-          eventId,
-          ticketTypeId: tt.id,
-          userId,
-          name: parsed.data.name,
-          email: parsed.data.email,
-          status: 'active',
-        })
-        .returning();
-      createdTickets.push(ticket);
-    }
+  for (let i = 0; i < parsed.data.quantity; i++) {
+    const ticketRef = generateTicketReference(orderRef, i);
+    const qrData = crypto.randomUUID();
+
+    const [ticket] = await db
+      .insert(tickets)
+      .values({
+        orderId: order.id,
+        eventId,
+        ticketTypeId: tt.id,
+        userId,
+        ticketReference: ticketRef,
+        qrData,
+        name: parsed.data.name,
+        email: parsed.data.email,
+        status: isPaid ? 'pending' : 'active',
+      })
+      .returning();
+    createdTickets.push(ticket);
   }
 
+  // Update sold count
   await db
     .update(ticketTypes)
     .set({ soldCount: (tt.soldCount ?? 0) + parsed.data.quantity })
     .where(eq(ticketTypes.id, tt.id));
+
+  // For paid tickets, create Stripe Checkout Session
+  let checkoutUrl: string | null = null;
+  if (isPaid && org?.stripeConnectedAccountId) {
+    const session = await createCheckoutSession({
+      connectedAccountId: org.stripeConnectedAccountId,
+      lineItems: [
+        {
+          price_data: {
+            currency: (tt.currency ?? 'EUR').toLowerCase(),
+            product_data: {
+              name: tt.name,
+              description: `${event.title} - ${tt.name}`,
+            },
+            unit_amount: Math.round(Number(tt.price) * 100), // cents
+          },
+          quantity: parsed.data.quantity,
+        },
+      ],
+      orderId: order.id,
+      platformFeeAmount,
+      currency: (tt.currency ?? 'EUR').toLowerCase(),
+      successUrl: `${config.appUrl}/api/v1/orders/${order.id}/success`,
+      cancelUrl: `${config.appUrl}/api/v1/orders/${order.id}/cancel`,
+      customerEmail: parsed.data.email,
+    });
+
+    checkoutUrl = session.url;
+
+    // Store checkout session ID on the order
+    await db
+      .update(orders)
+      .set({ stripeCheckoutSessionId: session.id })
+      .where(eq(orders.id, order.id));
+  }
 
   return c.json({
     order,
@@ -175,7 +180,7 @@ app.get('/me/tickets', requireJwt, async (c) => {
   });
 });
 
-// GET /tickets/:id — single ticket with QR
+// GET /tickets/:id — single ticket
 app.get('/tickets/:id', requireJwt, async (c) => {
   const userId = c.get('auth').userId!;
   const id = c.req.param('id')!;
@@ -190,7 +195,7 @@ app.get('/tickets/:id', requireJwt, async (c) => {
   return c.json({ ticket });
 });
 
-// GET /tickets/:id/qr — proxy QR code image from Tito
+// GET /tickets/:id/qr — generate QR code PNG
 app.get('/tickets/:id/qr', requireJwt, async (c) => {
   const userId = c.get('auth').userId!;
   const id = c.req.param('id')!;
@@ -202,14 +207,19 @@ app.get('/tickets/:id/qr', requireJwt, async (c) => {
     .limit(1);
 
   if (!ticket) return c.json({ error: 'Not found' }, 404);
-  if (!ticket.qrCodeUrl) return c.json({ error: 'No QR code available' }, 404);
+  if (!ticket.qrData) return c.json({ error: 'No QR code available' }, 404);
+  if (ticket.status !== 'active' && ticket.status !== 'checked_in') {
+    return c.json({ error: 'Ticket is not active' }, 400);
+  }
 
-  const resp = await fetch(ticket.qrCodeUrl);
-  if (!resp.ok) return c.json({ error: 'Failed to fetch QR code' }, 502);
+  const qrBuffer = await generateQrPng(ticket.qrData);
 
-  c.header('Content-Type', resp.headers.get('Content-Type') || 'image/png');
-  c.header('Cache-Control', 'public, max-age=3600');
-  return c.body(resp.body as ReadableStream);
+  return new Response(new Uint8Array(qrBuffer), {
+    headers: {
+      'Content-Type': 'image/png',
+      'Cache-Control': 'public, max-age=3600',
+    },
+  });
 });
 
 // POST /tickets/:id/void — void a ticket (API key)
@@ -218,25 +228,6 @@ app.post('/tickets/:id/void', requireApiKey, async (c) => {
 
   const [ticket] = await db.select().from(tickets).where(eq(tickets.id, id)).limit(1);
   if (!ticket) return c.json({ error: 'Not found' }, 404);
-
-  if (ticket.titoTicketSlug) {
-    const [event] = await db
-      .select()
-      .from(events)
-      .where(eq(events.id, ticket.eventId))
-      .limit(1);
-
-    if (event?.titoEventSlug) {
-      const tito = await getTitoClient(event.organizationId);
-      if (tito) {
-        try {
-          await tito.voidTicket(event.titoEventSlug, ticket.titoTicketSlug);
-        } catch {
-          // Non-fatal
-        }
-      }
-    }
-  }
 
   const [updated] = await db
     .update(tickets)

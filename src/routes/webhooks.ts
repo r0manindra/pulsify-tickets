@@ -1,66 +1,96 @@
 import { Hono } from 'hono';
-import crypto from 'node:crypto';
-import { config } from '../config.js';
-import {
-  handleRegistrationCompleted,
-  handleTicketCompleted,
-  handleTicketVoided,
-  handleRegistrationCancelled,
-  handleCheckin,
-} from '../services/sync.js';
+import { eq } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import { orders, tickets, organizations } from '../db/schema.js';
+import { constructWebhookEvent } from '../services/stripe.js';
 
 const app = new Hono();
 
-function verifyTitoSignature(body: string, signature: string | undefined): boolean {
-  if (!config.tito.webhookSecret) return true; // Skip verification if no secret configured
-  if (!signature) return false;
-
-  const expected = crypto
-    .createHmac('sha256', config.tito.webhookSecret)
-    .update(body)
-    .digest('base64');
-
-  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-}
-
-// POST /webhooks/tito — receive Tito webhook events
-app.post('/tito', async (c) => {
+// POST /webhooks/stripe — receive Stripe webhook events
+app.post('/stripe', async (c) => {
   const rawBody = await c.req.text();
-  const signature = c.req.header('Tito-Signature');
+  const signature = c.req.header('stripe-signature');
 
-  if (!verifyTitoSignature(rawBody, signature)) {
+  if (!signature) {
+    return c.json({ error: 'Missing signature' }, 400);
+  }
+
+  let event;
+  try {
+    event = constructWebhookEvent(rawBody, signature);
+  } catch (err) {
+    console.error('[Webhook] Signature verification failed:', err);
     return c.json({ error: 'Invalid signature' }, 401);
   }
 
-  const payload = JSON.parse(rawBody) as Record<string, unknown>;
-  const trigger = payload.trigger as string;
-
-  console.log(`[Webhook] Received: ${trigger}`);
+  console.log(`[Webhook] Received: ${event.type}`);
 
   try {
-    switch (trigger) {
-      case 'registration.finished':
-      case 'registration.completed':
-        await handleRegistrationCompleted(payload);
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        const orderId = session.metadata?.orderId;
+        if (!orderId) break;
+
+        // Activate the order
+        await db
+          .update(orders)
+          .set({
+            status: 'complete',
+            stripePaymentIntentId: typeof session.payment_intent === 'string'
+              ? session.payment_intent
+              : null,
+          })
+          .where(eq(orders.id, orderId));
+
+        // Activate all tickets for this order
+        await db
+          .update(tickets)
+          .set({ status: 'active' })
+          .where(eq(tickets.orderId, orderId));
+
+        console.log(`[Webhook] Order ${orderId} completed`);
         break;
-      case 'ticket.completed':
-        await handleTicketCompleted(payload);
+      }
+
+      case 'checkout.session.expired': {
+        const session = event.data.object;
+        const orderId = session.metadata?.orderId;
+        if (!orderId) break;
+
+        // Cancel the order
+        await db
+          .update(orders)
+          .set({ status: 'cancelled' })
+          .where(eq(orders.id, orderId));
+
+        // Cancel all tickets for this order
+        await db
+          .update(tickets)
+          .set({ status: 'cancelled' })
+          .where(eq(tickets.orderId, orderId));
+
+        console.log(`[Webhook] Order ${orderId} expired/cancelled`);
         break;
-      case 'ticket.voided':
-        await handleTicketVoided(payload);
+      }
+
+      case 'account.updated': {
+        const account = event.data.object;
+        if (account.charges_enabled) {
+          await db
+            .update(organizations)
+            .set({ stripeOnboardingComplete: true })
+            .where(eq(organizations.stripeConnectedAccountId, account.id));
+          console.log(`[Webhook] Account ${account.id} onboarding complete`);
+        }
         break;
-      case 'registration.cancelled':
-        await handleRegistrationCancelled(payload);
-        break;
-      case 'checkin.created':
-        await handleCheckin(payload);
-        break;
+      }
+
       default:
-        console.log(`[Webhook] Unhandled trigger: ${trigger}`);
+        console.log(`[Webhook] Unhandled event type: ${event.type}`);
     }
   } catch (err) {
-    console.error(`[Webhook] Error processing ${trigger}:`, err);
-    // Return 200 anyway to prevent Tito from retrying
+    console.error(`[Webhook] Error processing ${event.type}:`, err);
   }
 
   return c.json({ received: true });

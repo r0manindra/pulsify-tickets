@@ -5,16 +5,12 @@ import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { organizations } from '../db/schema.js';
 import { requireAdmin, requireApiKey } from '../middleware/auth.js';
+import { createConnectedAccount, createOnboardingLink, getAccountStatus } from '../services/stripe.js';
 
 const app = new Hono();
 
 const createOrgSchema = z.object({
   name: z.string().min(1),
-});
-
-const connectTitoSchema = z.object({
-  titoAccountSlug: z.string().min(1),
-  titoApiToken: z.string().min(1),
 });
 
 // POST /orgs — create org (admin only)
@@ -48,8 +44,8 @@ app.get('/:id', requireApiKey, async (c) => {
     .select({
       id: organizations.id,
       name: organizations.name,
-      titoAccountSlug: organizations.titoAccountSlug,
       stripeConnectedAccountId: organizations.stripeConnectedAccountId,
+      stripeOnboardingComplete: organizations.stripeOnboardingComplete,
       createdAt: organizations.createdAt,
     })
     .from(organizations)
@@ -61,8 +57,8 @@ app.get('/:id', requireApiKey, async (c) => {
   return c.json({ organization: org });
 });
 
-// POST /orgs/:id/connect-tito — store Tito credentials
-app.post('/:id/connect-tito', requireApiKey, async (c) => {
+// POST /orgs/:id/connect-stripe — start Stripe Connect onboarding
+app.post('/:id/connect-stripe', requireApiKey, async (c) => {
   const orgId = c.get('auth').organizationId!;
   const id = c.req.param('id')!;
 
@@ -70,22 +66,67 @@ app.post('/:id/connect-tito', requireApiKey, async (c) => {
     return c.json({ error: 'Forbidden' }, 403);
   }
 
-  const body = await c.req.json();
-  const parsed = connectTitoSchema.safeParse(body);
-  if (!parsed.success) {
-    return c.json({ error: 'Validation failed', details: parsed.error.flatten() }, 400);
+  const [org] = await db
+    .select()
+    .from(organizations)
+    .where(eq(organizations.id, id))
+    .limit(1);
+
+  if (!org) return c.json({ error: 'Not found' }, 404);
+
+  // If already has a Stripe account, just generate a new onboarding link
+  let accountId = org.stripeConnectedAccountId;
+
+  if (!accountId) {
+    const account = await createConnectedAccount(org.name);
+    accountId = account.id;
+
+    await db
+      .update(organizations)
+      .set({ stripeConnectedAccountId: accountId })
+      .where(eq(organizations.id, id));
   }
 
-  const [updated] = await db
-    .update(organizations)
-    .set({
-      titoAccountSlug: parsed.data.titoAccountSlug,
-      titoApiToken: parsed.data.titoApiToken,
-    })
-    .where(eq(organizations.id, id))
-    .returning();
+  const link = await createOnboardingLink(accountId, id);
 
-  return c.json({ organization: { id: updated.id, name: updated.name, titoAccountSlug: updated.titoAccountSlug } });
+  return c.json({ onboardingUrl: link.url });
+});
+
+// GET /orgs/:id/stripe-status — check Stripe onboarding status
+app.get('/:id/stripe-status', requireApiKey, async (c) => {
+  const orgId = c.get('auth').organizationId!;
+  const id = c.req.param('id')!;
+
+  if (orgId !== id) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const [org] = await db
+    .select()
+    .from(organizations)
+    .where(eq(organizations.id, id))
+    .limit(1);
+
+  if (!org) return c.json({ error: 'Not found' }, 404);
+
+  if (!org.stripeConnectedAccountId) {
+    return c.json({ status: 'not_started', chargesEnabled: false, payoutsEnabled: false });
+  }
+
+  const accountStatus = await getAccountStatus(org.stripeConnectedAccountId);
+
+  // Update onboarding status if charges are now enabled
+  if (accountStatus.chargesEnabled && !org.stripeOnboardingComplete) {
+    await db
+      .update(organizations)
+      .set({ stripeOnboardingComplete: true })
+      .where(eq(organizations.id, id));
+  }
+
+  return c.json({
+    status: accountStatus.chargesEnabled ? 'complete' : 'pending',
+    ...accountStatus,
+  });
 });
 
 export default app;

@@ -2,9 +2,8 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { eq, and } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { events, ticketTypes, organizations } from '../db/schema.js';
+import { events, ticketTypes } from '../db/schema.js';
 import { requireApiKey } from '../middleware/auth.js';
-import { TitoClient } from '../services/tito.js';
 
 const app = new Hono();
 
@@ -38,20 +37,6 @@ const updateEventSchema = z.object({
   metadata: z.record(z.unknown()).optional(),
 });
 
-async function getTitoClient(organizationId: string) {
-  const [org] = await db
-    .select()
-    .from(organizations)
-    .where(eq(organizations.id, organizationId))
-    .limit(1);
-
-  if (!org?.titoAccountSlug || !org?.titoApiToken) {
-    return null;
-  }
-
-  return new TitoClient(org.titoApiToken, org.titoAccountSlug);
-}
-
 // POST /events — create event
 app.post('/', requireApiKey, async (c) => {
   const orgId = c.get('auth').organizationId!;
@@ -62,26 +47,11 @@ app.post('/', requireApiKey, async (c) => {
   }
 
   const { ticketTypes: ttData, ...eventData } = parsed.data;
-  let titoEventSlug: string | null = null;
-
-  const tito = await getTitoClient(orgId);
-  if (tito) {
-    const titoResp = await tito.createEvent({
-      title: eventData.title,
-      description: eventData.description,
-      location: eventData.location,
-      start_date: eventData.startDate,
-      end_date: eventData.endDate,
-      currency: eventData.currency,
-    });
-    titoEventSlug = (titoResp.event as Record<string, unknown>).slug as string;
-  }
 
   const [event] = await db
     .insert(events)
     .values({
       organizationId: orgId,
-      titoEventSlug,
       title: eventData.title,
       description: eventData.description,
       location: eventData.location,
@@ -95,26 +65,10 @@ app.post('/', requireApiKey, async (c) => {
   const createdTypes = [];
   if (ttData && ttData.length > 0) {
     for (const tt of ttData) {
-      let titoReleaseId: string | null = null;
-      let titoReleaseSlug: string | null = null;
-
-      if (tito && titoEventSlug) {
-        const releaseResp = await tito.createRelease(titoEventSlug, {
-          title: tt.name,
-          price: String(tt.price),
-          quantity: tt.quantity,
-        });
-        const release = releaseResp.release as Record<string, unknown>;
-        titoReleaseId = String(release.id);
-        titoReleaseSlug = release.slug as string;
-      }
-
       const [ticketType] = await db
         .insert(ticketTypes)
         .values({
           eventId: event.id,
-          titoReleaseId,
-          titoReleaseSlug,
           name: tt.name,
           price: String(tt.price),
           currency: eventData.currency,
@@ -141,7 +95,7 @@ app.get('/', requireApiKey, async (c) => {
   return c.json({ events: eventList });
 });
 
-// GET /events/:id — get event with ticket types (public-ish)
+// GET /events/:id — get event with ticket types (public)
 app.get('/:id', async (c) => {
   const id = c.req.param('id')!;
 
@@ -174,20 +128,6 @@ app.patch('/:id', requireApiKey, async (c) => {
 
   if (!existing) return c.json({ error: 'Not found' }, 404);
 
-  const tito = await getTitoClient(orgId);
-  if (tito && existing.titoEventSlug) {
-    const titoData: Record<string, unknown> = {};
-    if (parsed.data.title) titoData.title = parsed.data.title;
-    if (parsed.data.description !== undefined) titoData.description = parsed.data.description;
-    if (parsed.data.location !== undefined) titoData.location = parsed.data.location;
-    if (parsed.data.startDate) titoData.start_date = parsed.data.startDate;
-    if (parsed.data.endDate) titoData.end_date = parsed.data.endDate;
-    if (parsed.data.isLive !== undefined) titoData.live = parsed.data.isLive;
-    if (Object.keys(titoData).length > 0) {
-      await tito.updateEvent(existing.titoEventSlug, titoData);
-    }
-  }
-
   const updateData: Record<string, unknown> = { updatedAt: new Date() };
   if (parsed.data.title) updateData.title = parsed.data.title;
   if (parsed.data.description !== undefined) updateData.description = parsed.data.description;
@@ -219,15 +159,6 @@ app.delete('/:id', requireApiKey, async (c) => {
     .limit(1);
 
   if (!existing) return c.json({ error: 'Not found' }, 404);
-
-  const tito = await getTitoClient(orgId);
-  if (tito && existing.titoEventSlug) {
-    try {
-      await tito.deleteEvent(existing.titoEventSlug);
-    } catch {
-      // Non-fatal
-    }
-  }
 
   await db.delete(ticketTypes).where(eq(ticketTypes.eventId, id));
   await db.delete(events).where(eq(events.id, id));

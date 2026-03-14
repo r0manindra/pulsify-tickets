@@ -3,12 +3,11 @@ export const config = {
   nodeEnv: process.env.NODE_ENV || 'development',
   adminSecret: process.env.API_ADMIN_SECRET || '',
   databaseUrl: process.env.DATABASE_URL || '',
-  tito: {
-    apiToken: process.env.TITO_API_TOKEN || '',
-    accountSlug: process.env.TITO_ACCOUNT_SLUG || '',
-    webhookSecret: process.env.TITO_WEBHOOK_SECRET || '',
-    baseUrl: 'https://api.tito.io/v3',
-    checkinBaseUrl: 'https://checkin.tito.io',
+  appUrl: process.env.APP_URL || 'http://localhost:3000',
+  stripe: {
+    secretKey: process.env.STRIPE_SECRET_KEY || '',
+    webhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
+    platformFeePercent: parseInt(process.env.STRIPE_PLATFORM_FEE_PERCENT || '10', 10),
   },
   jwt: {
     secret: process.env.JWT_SECRET || '',

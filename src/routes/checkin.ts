@@ -2,29 +2,17 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { eq, and } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { events, tickets, organizations } from '../db/schema.js';
+import { events, tickets } from '../db/schema.js';
 import { requireApiKey } from '../middleware/auth.js';
-import { TitoClient } from '../services/tito.js';
 
 const app = new Hono();
 
 const checkinSchema = z.object({
   ticketId: z.string().uuid().optional(),
-  ticketSlug: z.string().optional(),
-  checkinListSlug: z.string().optional(),
-}).refine((data) => data.ticketId || data.ticketSlug, {
-  message: 'Either ticketId or ticketSlug is required',
+  qrData: z.string().optional(),
+}).refine((data) => data.ticketId || data.qrData, {
+  message: 'Either ticketId or qrData is required',
 });
-
-async function getTitoClient(organizationId: string) {
-  const [org] = await db
-    .select()
-    .from(organizations)
-    .where(eq(organizations.id, organizationId))
-    .limit(1);
-  if (!org?.titoAccountSlug || !org?.titoApiToken) return null;
-  return new TitoClient(org.titoApiToken, org.titoAccountSlug);
-}
 
 // POST /events/:id/checkin — check in a ticket
 app.post('/:id/checkin', requireApiKey, async (c) => {
@@ -50,11 +38,11 @@ app.post('/:id/checkin', requireApiKey, async (c) => {
       .from(tickets)
       .where(and(eq(tickets.id, parsed.data.ticketId), eq(tickets.eventId, eventId)))
       .limit(1);
-  } else if (parsed.data.ticketSlug) {
+  } else if (parsed.data.qrData) {
     [ticket] = await db
       .select()
       .from(tickets)
-      .where(and(eq(tickets.titoTicketSlug, parsed.data.ticketSlug), eq(tickets.eventId, eventId)))
+      .where(and(eq(tickets.qrData, parsed.data.qrData), eq(tickets.eventId, eventId)))
       .limit(1);
   }
 
@@ -68,22 +56,8 @@ app.post('/:id/checkin', requireApiKey, async (c) => {
     return c.json({ error: `Ticket is ${ticket.status}` }, 400);
   }
 
-  let titoCheckinId: string | null = null;
-  const tito = await getTitoClient(orgId);
-  if (tito && ticket.titoTicketSlug) {
-    let checkinListSlug = parsed.data.checkinListSlug;
-    if (!checkinListSlug && event.titoEventSlug) {
-      const listsResp = await tito.listCheckinLists(event.titoEventSlug);
-      const lists = listsResp.checkin_lists;
-      if (lists.length > 0) {
-        checkinListSlug = (lists[0] as Record<string, unknown>).slug as string;
-      }
-    }
-
-    if (checkinListSlug) {
-      const resp = await tito.checkin(checkinListSlug, ticket.titoTicketSlug);
-      titoCheckinId = resp ? String((resp as Record<string, unknown>).id) : null;
-    }
+  if (ticket.status !== 'active') {
+    return c.json({ error: 'Ticket is not active' }, 400);
   }
 
   const now = new Date();
@@ -95,7 +69,7 @@ app.post('/:id/checkin', requireApiKey, async (c) => {
 
   return c.json({
     ticket: updated,
-    checkin: { titoCheckinId, checkedInAt: now },
+    checkin: { checkedInAt: now },
   });
 });
 
@@ -152,7 +126,7 @@ app.get('/:id/attendees', requireApiKey, async (c) => {
       email: t.email,
       status: t.status,
       checkedInAt: t.checkedInAt,
-      ticketReference: t.titoReference,
+      ticketReference: t.ticketReference,
     })),
     summary: {
       total: attendees.length,

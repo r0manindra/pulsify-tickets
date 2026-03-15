@@ -11,6 +11,12 @@ const app = new Hono();
 
 const createOrgSchema = z.object({
   name: z.string().min(1),
+  tier: z.enum(['freemium', 'basic', 'premium']).default('freemium'),
+});
+
+const updateOrgSchema = z.object({
+  name: z.string().min(1).optional(),
+  tier: z.enum(['freemium', 'basic', 'premium']).optional(),
 });
 
 // POST /orgs — create org (admin only)
@@ -25,7 +31,7 @@ app.post('/', requireAdmin, async (c) => {
 
   const [org] = await db
     .insert(organizations)
-    .values({ name: parsed.data.name, apiKey })
+    .values({ name: parsed.data.name, tier: parsed.data.tier, apiKey })
     .returning();
 
   return c.json({ organization: org }, 201);
@@ -44,6 +50,7 @@ app.get('/:id', requireApiKey, async (c) => {
     .select({
       id: organizations.id,
       name: organizations.name,
+      tier: organizations.tier,
       stripeConnectedAccountId: organizations.stripeConnectedAccountId,
       stripeOnboardingComplete: organizations.stripeOnboardingComplete,
       createdAt: organizations.createdAt,
@@ -55,6 +62,30 @@ app.get('/:id', requireApiKey, async (c) => {
   if (!org) return c.json({ error: 'Not found' }, 404);
 
   return c.json({ organization: org });
+});
+
+// PATCH /orgs/:id — update org (admin only, used by .NET backend to sync tier)
+app.patch('/:id', requireAdmin, async (c) => {
+  const id = c.req.param('id')!;
+  const body = await c.req.json();
+  const parsed = updateOrgSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: 'Validation failed', details: parsed.error.flatten() }, 400);
+  }
+
+  const updateData: Record<string, unknown> = {};
+  if (parsed.data.name) updateData.name = parsed.data.name;
+  if (parsed.data.tier) updateData.tier = parsed.data.tier;
+
+  const [updated] = await db
+    .update(organizations)
+    .set(updateData)
+    .where(eq(organizations.id, id))
+    .returning();
+
+  if (!updated) return c.json({ error: 'Not found' }, 404);
+
+  return c.json({ organization: updated });
 });
 
 // POST /orgs/:id/connect-stripe — start Stripe Connect onboarding

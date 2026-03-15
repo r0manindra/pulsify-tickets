@@ -8,6 +8,7 @@ import { requireApiKey, requireJwt } from '../middleware/auth.js';
 import { createCheckoutSession } from '../services/stripe.js';
 import { generateQrPng } from '../services/qr.js';
 import { generateOrderReference, generateTicketReference } from '../services/references.js';
+import { calculatePlatformFee } from '../services/fees.js';
 import { config } from '../config.js';
 
 const app = new Hono();
@@ -61,9 +62,11 @@ app.post('/events/:id/register', requireJwt, async (c) => {
     }
   }
 
-  // Calculate platform fee
+  // Calculate platform fee based on org tier
+  // Freemium: 10% + 1€/ticket, Basic: 8% + 1€/ticket, Premium: 5% + 1€/ticket
+  const totalAmountCents = Math.round(totalAmount * 100);
   const platformFeeAmount = isPaid
-    ? Math.round(totalAmount * 100 * config.stripe.platformFeePercent / 100) // in cents
+    ? calculatePlatformFee(org?.tier ?? 'freemium', totalAmountCents, parsed.data.quantity)
     : 0;
 
   // Create order

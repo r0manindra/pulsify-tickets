@@ -3,6 +3,7 @@ import { pgTable, uuid, text, timestamp, integer, decimal, boolean, jsonb } from
 export const organizations = pgTable('organizations', {
   id: uuid('id').defaultRandom().primaryKey(),
   name: text('name').notNull(),
+  tier: text('tier').default('freemium'),
   stripeConnectedAccountId: text('stripe_account_id'),
   stripeOnboardingComplete: boolean('stripe_onboarding_complete').default(false),
   apiKey: text('api_key').notNull().unique(),

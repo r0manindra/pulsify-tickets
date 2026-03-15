@@ -487,3 +487,566 @@ const qrResp = await fetch(`${API_BASE}/tickets/${ticketId}/qr`, {
 });
 // → PNG Bild des QR-Codes
 ```
+
+---
+
+## Integrationsanleitung: Bestehendes System anbinden
+
+Diese Anleitung beschreibt wie der Ticket Service in das bestehende Pulsify-System integriert wird, waehrend die Migration von .NET C# zu Hono TypeScript laeuft.
+
+### Architektur-Ueberblick
+
+```
+┌──────────────────────┐         ┌────────────────────────────────┐
+│  Pulsify Backend     │         │  Pulsify Ticket Service        │
+│  (.NET C# / Railway) │────────>│  (Hono / Railway)              │
+│                      │  HTTP   │  pulsify-tickets-production    │
+│  - User Auth         │         │  .up.railway.app               │
+│  - Business Logic    │         │                                │
+│  - Org Management    │         │  Verwaltet:                    │
+└──────────┬───────────┘         │  - Events + Ticketarten        │
+           │                     │  - Bestellungen + Tickets      │
+           │                     │  - Stripe Connect Zahlungen    │
+           │                     │  - QR-Codes + Check-in         │
+┌──────────┴───────────┐         └────────────────────────────────┘
+│  Pulsify Dashboard   │                      ▲
+│  (React/Next.js)     │──────────────────────┘
+│                      │         ┌────────────────────────────────┐
+│  Pulsify App         │         │  Stripe                        │
+│  (React Native)      │────────>│  - Checkout (Zahlung)          │
+└──────────────────────┘         │  - Connect (Business-Payouts)  │
+                                 │  - Webhooks (Bestaetigung)     │
+                                 └────────────────────────────────┘
+```
+
+**Wichtig:** Das .NET Backend ruft den Ticket Service mit dem `API_ADMIN_SECRET` oder dem `API Key` der Organisation auf. Die Mobile App ruft den Ticket Service direkt mit dem JWT des Users auf. Beide nutzen dasselbe `JWT_SECRET`.
+
+---
+
+### Phase 1: Backend-Integration (.NET C#)
+
+#### 1.1 Org automatisch im Ticket Service erstellen
+
+Wenn ein Business sich auf Pulsify registriert, muss das .NET Backend automatisch eine Organisation im Ticket Service erstellen und den API Key speichern.
+
+```csharp
+// In eurem BusinessRegistrationService oder aehnlich
+public async Task<string> CreateTicketOrg(string businessName)
+{
+    var client = new HttpClient();
+    client.DefaultRequestHeaders.Add("Authorization", $"Bearer {ADMIN_SECRET}");
+
+    var response = await client.PostAsJsonAsync(
+        "https://pulsify-tickets-production.up.railway.app/api/v1/orgs",
+        new { name = businessName }
+    );
+
+    var result = await response.Content.ReadFromJsonAsync<OrgResponse>();
+
+    // DIESEN API KEY IN EURER DB SPEICHERN!
+    // z.B. in der Business-Tabelle: ticket_service_api_key, ticket_service_org_id
+    return result.Organization.ApiKey;  // "pk_..."
+}
+```
+
+**In eurer .NET Datenbank hinzufuegen (Business-Tabelle):**
+
+| Spalte | Typ | Beschreibung |
+|--------|-----|-------------|
+| ticket_service_org_id | VARCHAR | UUID der Org im Ticket Service |
+| ticket_service_api_key | VARCHAR | API Key (`pk_...`) fuer den Ticket Service |
+
+#### 1.2 JWT Secret teilen
+
+Beide Services muessen das gleiche `JWT_SECRET` verwenden, damit der Ticket Service die JWTs vom .NET Backend verifizieren kann.
+
+**Wichtig:** Der JWT muss ein `sub` Claim mit der Pulsify User ID enthalten:
+
+```csharp
+// Im .NET Backend beim JWT erstellen
+var claims = new[]
+{
+    new Claim(JwtRegisteredClaimNames.Sub, userId),  // MUSS "sub" sein
+    // ... andere Claims
+};
+```
+
+---
+
+### Phase 2: Dashboard-Integration (React/Next.js)
+
+Das Dashboard braucht 4 neue Features:
+
+#### 2.1 API Client erstellen
+
+```typescript
+// lib/ticket-service.ts
+const TICKET_API = 'https://pulsify-tickets-production.up.railway.app/api/v1';
+
+export class TicketServiceClient {
+  constructor(private apiKey: string) {}
+
+  private async request(path: string, options?: RequestInit) {
+    const res = await fetch(`${TICKET_API}${path}`, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+        ...options?.headers,
+      },
+    });
+    if (!res.ok) {
+      const error = await res.json();
+      throw new Error(error.error || 'Ticket Service Error');
+    }
+    return res.json();
+  }
+
+  // --- Stripe Connect ---
+  async connectStripe(orgId: string) {
+    return this.request(`/orgs/${orgId}/connect-stripe`, { method: 'POST' });
+  }
+
+  async getStripeStatus(orgId: string) {
+    return this.request(`/orgs/${orgId}/stripe-status`);
+  }
+
+  // --- Events ---
+  async createEvent(data: {
+    title: string;
+    startDate: string;
+    endDate?: string;
+    location?: string;
+    description?: string;
+    ticketTypes?: { name: string; price: string; quantity?: number }[];
+  }) {
+    return this.request('/events', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async getEvents() {
+    return this.request('/events');
+  }
+
+  async getEvent(eventId: string) {
+    return this.request(`/events/${eventId}`);
+  }
+
+  async updateEvent(eventId: string, data: Record<string, unknown>) {
+    return this.request(`/events/${eventId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async deleteEvent(eventId: string) {
+    return this.request(`/events/${eventId}`, { method: 'DELETE' });
+  }
+
+  // --- Ticket Types ---
+  async createTicketType(eventId: string, data: {
+    name: string;
+    price: string;
+    quantity?: number;
+  }) {
+    return this.request(`/events/${eventId}/ticket-types`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async getTicketTypes(eventId: string) {
+    return this.request(`/events/${eventId}/ticket-types`);
+  }
+
+  // --- Attendees ---
+  async getAttendees(eventId: string) {
+    return this.request(`/events/${eventId}/attendees`);
+  }
+
+  // --- Check-in ---
+  async checkin(eventId: string, data: { ticketId?: string; qrData?: string }) {
+    return this.request(`/events/${eventId}/checkin`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async undoCheckin(eventId: string, ticketId: string) {
+    return this.request(`/events/${eventId}/checkin/${ticketId}`, {
+      method: 'DELETE',
+    });
+  }
+}
+```
+
+#### 2.2 Feature: Stripe Connect Onboarding (Business Settings)
+
+Auf der Business-Settings-Seite einen "Zahlungen verbinden" Button hinzufuegen:
+
+```tsx
+// components/StripeConnectButton.tsx
+import { useState, useEffect } from 'react';
+
+export function StripeConnectButton({ orgId, apiKey }: { orgId: string; apiKey: string }) {
+  const [status, setStatus] = useState<'loading' | 'not_started' | 'pending' | 'complete'>('loading');
+  const client = new TicketServiceClient(apiKey);
+
+  useEffect(() => {
+    client.getStripeStatus(orgId).then((res) => {
+      setStatus(res.status);
+    });
+  }, [orgId]);
+
+  const handleConnect = async () => {
+    const { onboardingUrl } = await client.connectStripe(orgId);
+    window.location.href = onboardingUrl; // Weiterleitung zu Stripe
+  };
+
+  if (status === 'loading') return <p>Laden...</p>;
+  if (status === 'complete') return <p>Zahlungen verbunden</p>;
+
+  return (
+    <button onClick={handleConnect}>
+      {status === 'pending' ? 'Onboarding fortsetzen' : 'Zahlungen verbinden'}
+    </button>
+  );
+}
+```
+
+#### 2.3 Feature: Event erstellen mit Ticketarten
+
+```tsx
+// pages/events/create.tsx (vereinfacht)
+async function handleCreateEvent(formData: EventFormData) {
+  const client = new TicketServiceClient(business.ticketServiceApiKey);
+
+  const { event } = await client.createEvent({
+    title: formData.title,
+    startDate: formData.startDate,
+    endDate: formData.endDate,
+    location: formData.location,
+    description: formData.description,
+    ticketTypes: formData.ticketTypes.map((tt) => ({
+      name: tt.name,
+      price: tt.price.toString(),
+      quantity: tt.quantity,
+    })),
+  });
+
+  // Event-ID auch im .NET Backend speichern fuer Referenz
+  await savePulsifyEventRef(event.id);
+
+  router.push(`/events/${event.id}`);
+}
+```
+
+#### 2.4 Feature: Teilnehmerliste + Check-in
+
+```tsx
+// pages/events/[id]/attendees.tsx
+export function AttendeesPage({ eventId, apiKey }: Props) {
+  const [data, setData] = useState<{ attendees: Attendee[]; summary: Summary } | null>(null);
+  const client = new TicketServiceClient(apiKey);
+
+  useEffect(() => {
+    client.getAttendees(eventId).then(setData);
+  }, [eventId]);
+
+  if (!data) return <p>Laden...</p>;
+
+  return (
+    <div>
+      <h2>Teilnehmer</h2>
+      <div>
+        <span>Gesamt: {data.summary.total}</span>
+        <span>Eingecheckt: {data.summary.checkedIn}</span>
+        <span>Ausstehend: {data.summary.pending}</span>
+      </div>
+
+      <table>
+        <thead>
+          <tr><th>Name</th><th>E-Mail</th><th>Status</th><th>Referenz</th></tr>
+        </thead>
+        <tbody>
+          {data.attendees.map((a) => (
+            <tr key={a.ticketId}>
+              <td>{a.name}</td>
+              <td>{a.email}</td>
+              <td>{a.status}</td>
+              <td>{a.ticketReference}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+```
+
+---
+
+### Phase 3: Mobile App Integration (React Native)
+
+Die App braucht 3 neue Features:
+
+#### 3.1 API Client erstellen
+
+```typescript
+// services/ticketApi.ts
+import { getAuthToken } from './auth'; // Euer bestehendes Auth-System
+
+const TICKET_API = 'https://pulsify-tickets-production.up.railway.app/api/v1';
+
+async function ticketRequest(path: string, options?: RequestInit) {
+  const token = await getAuthToken(); // JWT vom .NET Backend
+
+  const res = await fetch(`${TICKET_API}${path}`, {
+    ...options,
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      ...options?.headers,
+    },
+  });
+
+  if (!res.ok) {
+    const error = await res.json();
+    throw new Error(error.error || 'Ticket Service Error');
+  }
+  return res.json();
+}
+
+// Event-Details + Ticketarten laden (oeffentlich, kein Auth noetig)
+export async function getEvent(eventId: string) {
+  const res = await fetch(`${TICKET_API}/events/${eventId}`);
+  return res.json();
+}
+
+// Ticket kaufen/registrieren
+export async function registerForEvent(eventId: string, data: {
+  name: string;
+  email: string;
+  ticketTypeId: string;
+  quantity: number;
+}) {
+  return ticketRequest(`/events/${eventId}/register`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+// Meine Tickets laden
+export async function getMyTickets() {
+  return ticketRequest('/me/tickets');
+}
+
+// Einzelnes Ticket laden
+export async function getTicket(ticketId: string) {
+  return ticketRequest(`/tickets/${ticketId}`);
+}
+
+// QR-Code als Bild-URL
+export function getQrCodeUrl(ticketId: string) {
+  // Hinweis: Dieser Endpoint braucht Auth im Header,
+  // daher besser als fetch mit Auth-Header laden (siehe TicketScreen)
+  return `${TICKET_API}/tickets/${ticketId}/qr`;
+}
+```
+
+#### 3.2 Feature: Event-Detail Screen mit "Ticket kaufen"
+
+```tsx
+// screens/EventDetailScreen.tsx
+import { WebView } from 'react-native-webview';
+import { registerForEvent, getEvent } from '../services/ticketApi';
+
+export function EventDetailScreen({ eventId }) {
+  const [event, setEvent] = useState(null);
+  const [checkoutUrl, setCheckoutUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    getEvent(eventId).then((res) => setEvent(res.event));
+  }, [eventId]);
+
+  const handleBuyTicket = async (ticketTypeId: string) => {
+    const { order, tickets, checkoutUrl } = await registerForEvent(eventId, {
+      name: user.name,
+      email: user.email,
+      ticketTypeId,
+      quantity: 1,
+    });
+
+    if (checkoutUrl) {
+      // Bezahltes Ticket → Stripe Checkout im WebView oeffnen
+      setCheckoutUrl(checkoutUrl);
+    } else {
+      // Kostenloses Ticket → sofort fertig
+      Alert.alert('Ticket erhalten!', `Referenz: ${tickets[0].ticketReference}`);
+      navigation.navigate('MyTickets');
+    }
+  };
+
+  // Stripe Checkout WebView
+  if (checkoutUrl) {
+    return (
+      <WebView
+        source={{ uri: checkoutUrl }}
+        onNavigationStateChange={(navState) => {
+          // Wenn Stripe zurueckleitet (success oder cancel URL)
+          if (navState.url.includes('/success') || navState.url.includes('/cancel')) {
+            setCheckoutUrl(null);
+            navigation.navigate('MyTickets');
+          }
+        }}
+      />
+    );
+  }
+
+  if (!event) return <ActivityIndicator />;
+
+  return (
+    <View>
+      <Text style={styles.title}>{event.title}</Text>
+      <Text>{event.location}</Text>
+      <Text>{new Date(event.startDate).toLocaleDateString('de')}</Text>
+
+      <Text style={styles.subtitle}>Tickets</Text>
+      {event.ticketTypes.map((tt) => (
+        <TouchableOpacity key={tt.id} onPress={() => handleBuyTicket(tt.id)}>
+          <View style={styles.ticketCard}>
+            <Text>{tt.name}</Text>
+            <Text>{Number(tt.price) === 0 ? 'Kostenlos' : `${tt.price} ${tt.currency}`}</Text>
+            <Text>{tt.available !== null ? `${tt.available} verfuegbar` : 'Unbegrenzt'}</Text>
+          </View>
+        </TouchableOpacity>
+      ))}
+    </View>
+  );
+}
+```
+
+#### 3.3 Feature: Meine Tickets mit QR-Code
+
+```tsx
+// screens/MyTicketsScreen.tsx
+import { getMyTickets } from '../services/ticketApi';
+
+export function MyTicketsScreen() {
+  const [tickets, setTickets] = useState([]);
+
+  useEffect(() => {
+    getMyTickets().then((res) => setTickets(res.tickets));
+  }, []);
+
+  return (
+    <FlatList
+      data={tickets}
+      keyExtractor={(item) => item.id}
+      renderItem={({ item }) => (
+        <TouchableOpacity onPress={() => navigation.navigate('TicketDetail', { id: item.id })}>
+          <View style={styles.ticketCard}>
+            <Text style={styles.eventTitle}>{item.event.title}</Text>
+            <Text>{item.ticketType}</Text>
+            <Text>Ref: {item.ticketReference}</Text>
+            <View style={[
+              styles.statusBadge,
+              { backgroundColor: item.status === 'active' ? '#4CAF50' : '#9E9E9E' }
+            ]}>
+              <Text style={styles.statusText}>{item.status}</Text>
+            </View>
+          </View>
+        </TouchableOpacity>
+      )}
+    />
+  );
+}
+```
+
+```tsx
+// screens/TicketDetailScreen.tsx
+import { getAuthToken } from '../services/auth';
+
+export function TicketDetailScreen({ ticketId }) {
+  const [ticket, setTicket] = useState(null);
+  const [qrImage, setQrImage] = useState<string | null>(null);
+
+  useEffect(() => {
+    getTicket(ticketId).then((res) => setTicket(res.ticket));
+    loadQrCode();
+  }, [ticketId]);
+
+  const loadQrCode = async () => {
+    const token = await getAuthToken();
+    const res = await fetch(
+      `https://pulsify-tickets-production.up.railway.app/api/v1/tickets/${ticketId}/qr`,
+      { headers: { 'Authorization': `Bearer ${token}` } }
+    );
+    const blob = await res.blob();
+    const reader = new FileReader();
+    reader.onload = () => setQrImage(reader.result as string);
+    reader.readAsDataURL(blob);
+  };
+
+  if (!ticket) return <ActivityIndicator />;
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>{ticket.name}</Text>
+      <Text>Referenz: {ticket.ticketReference}</Text>
+      <Text>Status: {ticket.status}</Text>
+
+      {qrImage && (
+        <Image source={{ uri: qrImage }} style={{ width: 300, height: 300 }} />
+      )}
+
+      <Text style={styles.hint}>
+        Zeige diesen QR-Code beim Einlass vor
+      </Text>
+    </View>
+  );
+}
+```
+
+---
+
+### Zusammenfassung: Was muss wo gemacht werden
+
+#### .NET C# Backend (minimal, 2 Aenderungen)
+
+| # | Aufgabe | Beschreibung |
+|---|---------|-------------|
+| 1 | DB-Spalten hinzufuegen | `ticket_service_org_id` + `ticket_service_api_key` in Business-Tabelle |
+| 2 | Auto-Provisioning | Bei Business-Registrierung: `POST /orgs` aufrufen, API Key speichern |
+
+#### Dashboard (React/Next.js, 4 Features)
+
+| # | Feature | Seite | Beschreibung |
+|---|---------|-------|-------------|
+| 1 | Stripe Connect | Business Settings | "Zahlungen verbinden" Button → oeffnet Stripe Onboarding |
+| 2 | Events verwalten | Events-Seite | CRUD fuer Events + Ticketarten ueber Ticket Service API |
+| 3 | Teilnehmerliste | Event-Detail | Zeigt Teilnehmer, Check-in Status, Zusammenfassung |
+| 4 | Check-in Tool | Event-Detail | QR-Scanner oder manuelle Eingabe fuer Check-in |
+
+#### Mobile App (React Native, 3 Features)
+
+| # | Feature | Screen | Beschreibung |
+|---|---------|--------|-------------|
+| 1 | Ticket kaufen | Event-Detail | Ticketart waehlen, kostenlos → sofort, bezahlt → Stripe WebView |
+| 2 | Meine Tickets | Tab/Screen | Liste aller Tickets mit Status |
+| 3 | QR-Code anzeigen | Ticket-Detail | QR-Code Bild vom Ticket Service laden + anzeigen |
+
+#### Reihenfolge der Implementierung
+
+```
+1. Backend: DB-Spalten + Auto-Provisioning        (1 Tag)
+2. Dashboard: API Client + Stripe Connect Button   (1 Tag)
+3. Dashboard: Event-Verwaltung                     (1-2 Tage)
+4. App: Ticket kaufen + Stripe WebView             (1-2 Tage)
+5. App: Meine Tickets + QR-Code                    (1 Tag)
+6. Dashboard: Teilnehmerliste + Check-in           (1 Tag)
+```
+
+Alles kann parallel entwickelt werden, weil der Ticket Service bereits laeuft und getestet ist.

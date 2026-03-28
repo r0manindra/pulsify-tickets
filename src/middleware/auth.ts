@@ -7,6 +7,12 @@ import { organizations } from '../db/schema.js';
 import { config } from '../config.js';
 import type { AuthPayload } from '../types/index.js';
 
+const jwtVerifyOptions: jwt.VerifyOptions = {
+  algorithms: [config.jwt.algorithm],
+  issuer: config.jwt.issuer,
+  audience: config.jwt.audience,
+};
+
 declare module 'hono' {
   interface ContextVariableMap {
     auth: AuthPayload;
@@ -46,7 +52,7 @@ export const requireJwt = createMiddleware(async (c: Context, next: Next) => {
   const token = header.slice(7);
 
   try {
-    const payload = jwt.verify(token, config.jwt.secret) as { sub: string; [key: string]: unknown };
+    const payload = jwt.verify(token, config.jwt.secret, jwtVerifyOptions) as { sub: string; [key: string]: unknown };
     c.set('auth', { type: 'jwt', userId: payload.sub });
   } catch {
     return c.json({ error: 'Invalid or expired token' }, 401);
@@ -78,7 +84,7 @@ export const requireApiKeyOrJwt = createMiddleware(async (c: Context, next: Next
 
   // Fall back to JWT — just verify it's valid, no org claim needed
   try {
-    const payload = jwt.verify(token, config.jwt.secret) as { sub: string; organizationId?: string; [key: string]: unknown };
+    const payload = jwt.verify(token, config.jwt.secret, jwtVerifyOptions) as { sub: string; organizationId?: string; [key: string]: unknown };
     c.set('auth', { type: 'jwt', userId: payload.sub, organizationId: payload.organizationId });
   } catch {
     return c.json({ error: 'Invalid credentials' }, 401);

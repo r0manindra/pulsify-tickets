@@ -1,3 +1,5 @@
+import type jwt from 'jsonwebtoken';
+
 export const config = {
   port: parseInt(process.env.PORT || '3000', 10),
   nodeEnv: process.env.NODE_ENV || 'development',
@@ -10,5 +12,8 @@ export const config = {
   },
   jwt: {
     secret: process.env.JWT_SECRET || '',
+    issuer: process.env.JWT_ISSUER || 'pulsify-issuer',
+    audience: process.env.JWT_AUDIENCE || 'pulsify-audience',
+    algorithm: (process.env.JWT_ALGORITHM || 'HS512') as jwt.Algorithm,
   },
 } as const;

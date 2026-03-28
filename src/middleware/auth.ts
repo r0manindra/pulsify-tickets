@@ -76,12 +76,9 @@ export const requireApiKeyOrJwt = createMiddleware(async (c: Context, next: Next
     return next();
   }
 
-  // Fall back to JWT
+  // Fall back to JWT — just verify it's valid, no org claim needed
   try {
     const payload = jwt.verify(token, config.jwt.secret) as { sub: string; organizationId?: string; [key: string]: unknown };
-    if (!payload.organizationId) {
-      return c.json({ error: 'JWT missing organizationId claim' }, 403);
-    }
     c.set('auth', { type: 'jwt', userId: payload.sub, organizationId: payload.organizationId });
   } catch {
     return c.json({ error: 'Invalid credentials' }, 401);

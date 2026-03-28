@@ -4,14 +4,14 @@ import crypto from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { organizations } from '../db/schema.js';
-import { requireAdmin, requireApiKey, requireApiKeyOrJwt } from '../middleware/auth.js';
+import { requireAdmin, requireApiKey, requireApiKeyOrJwt, requireJwt } from '../middleware/auth.js';
 import { createConnectedAccount, createOnboardingLink, getAccountStatus } from '../services/stripe.js';
 
 const app = new Hono();
 
 const createOrgSchema = z.object({
+  id: z.string().uuid(),
   name: z.string().min(1),
-  tier: z.enum(['freemium', 'basic', 'premium']).default('freemium'),
 });
 
 const updateOrgSchema = z.object({
@@ -19,19 +19,30 @@ const updateOrgSchema = z.object({
   tier: z.enum(['freemium', 'basic', 'premium']).optional(),
 });
 
-// POST /orgs — create org (admin only)
-app.post('/', requireAdmin, async (c) => {
+// POST /orgs — activate ticket service for an org (JWT auth)
+app.post('/', requireJwt, async (c) => {
   const body = await c.req.json();
   const parsed = createOrgSchema.safeParse(body);
   if (!parsed.success) {
     return c.json({ error: 'Validation failed', details: parsed.error.flatten() }, 400);
   }
 
+  // Check if org already exists
+  const [existing] = await db
+    .select()
+    .from(organizations)
+    .where(eq(organizations.id, parsed.data.id))
+    .limit(1);
+
+  if (existing) {
+    return c.json({ error: 'Organization already activated' }, 409);
+  }
+
   const apiKey = `pk_${crypto.randomBytes(24).toString('hex')}`;
 
   const [org] = await db
     .insert(organizations)
-    .values({ name: parsed.data.name, tier: parsed.data.tier, apiKey })
+    .values({ id: parsed.data.id, name: parsed.data.name, apiKey })
     .returning();
 
   return c.json({ organization: org }, 201);
@@ -42,7 +53,8 @@ app.get('/:id', requireApiKeyOrJwt, async (c) => {
   const auth = c.get('auth');
   const id = c.req.param('id')!;
 
-  if (auth.organizationId !== id) {
+  // API key auth: enforce ownership
+  if (auth.type === 'api_key' && auth.organizationId !== id) {
     return c.json({ error: 'Forbidden' }, 403);
   }
 

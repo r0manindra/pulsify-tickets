@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { organizations } from '../db/schema.js';
-import { requireAdmin, requireApiKey } from '../middleware/auth.js';
+import { requireAdmin, requireApiKey, requireApiKeyOrJwt } from '../middleware/auth.js';
 import { createConnectedAccount, createOnboardingLink, getAccountStatus } from '../services/stripe.js';
 
 const app = new Hono();
@@ -37,24 +37,31 @@ app.post('/', requireAdmin, async (c) => {
   return c.json({ organization: org }, 201);
 });
 
-// GET /orgs/:id — get org details (API key)
-app.get('/:id', requireApiKey, async (c) => {
-  const orgId = c.get('auth').organizationId!;
+// GET /orgs/:id — get org details (API key or JWT)
+app.get('/:id', requireApiKeyOrJwt, async (c) => {
+  const auth = c.get('auth');
   const id = c.req.param('id')!;
 
-  if (orgId !== id) {
+  if (auth.organizationId !== id) {
     return c.json({ error: 'Forbidden' }, 403);
   }
 
+  const selectFields: Record<string, any> = {
+    id: organizations.id,
+    name: organizations.name,
+    tier: organizations.tier,
+    stripeConnectedAccountId: organizations.stripeConnectedAccountId,
+    stripeOnboardingComplete: organizations.stripeOnboardingComplete,
+    createdAt: organizations.createdAt,
+  };
+
+  // Include apiKey when authenticated via JWT (for app bootstrap)
+  if (auth.type === 'jwt') {
+    selectFields.apiKey = organizations.apiKey;
+  }
+
   const [org] = await db
-    .select({
-      id: organizations.id,
-      name: organizations.name,
-      tier: organizations.tier,
-      stripeConnectedAccountId: organizations.stripeConnectedAccountId,
-      stripeOnboardingComplete: organizations.stripeOnboardingComplete,
-      createdAt: organizations.createdAt,
-    })
+    .select(selectFields)
     .from(organizations)
     .where(eq(organizations.id, id))
     .limit(1);

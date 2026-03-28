@@ -55,6 +55,41 @@ export const requireJwt = createMiddleware(async (c: Context, next: Next) => {
   await next();
 });
 
+/** Middleware: accepts API key OR JWT (for org bootstrap from mobile/dashboard) */
+export const requireApiKeyOrJwt = createMiddleware(async (c: Context, next: Next) => {
+  const header = c.req.header('Authorization');
+  if (!header?.startsWith('Bearer ')) {
+    return c.json({ error: 'Missing Authorization header' }, 401);
+  }
+
+  const token = header.slice(7);
+
+  // Try API key first
+  const [org] = await db
+    .select()
+    .from(organizations)
+    .where(eq(organizations.apiKey, token))
+    .limit(1);
+
+  if (org) {
+    c.set('auth', { type: 'api_key', organizationId: org.id });
+    return next();
+  }
+
+  // Fall back to JWT
+  try {
+    const payload = jwt.verify(token, config.jwt.secret) as { sub: string; organizationId?: string; [key: string]: unknown };
+    if (!payload.organizationId) {
+      return c.json({ error: 'JWT missing organizationId claim' }, 403);
+    }
+    c.set('auth', { type: 'jwt', userId: payload.sub, organizationId: payload.organizationId });
+  } catch {
+    return c.json({ error: 'Invalid credentials' }, 401);
+  }
+
+  await next();
+});
+
 /** Middleware: requires admin secret (for creating orgs) */
 export const requireAdmin = createMiddleware(async (c: Context, next: Next) => {
   const header = c.req.header('Authorization');

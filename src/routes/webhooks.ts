@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
-import { eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { orders, tickets, organizations } from '../db/schema.js';
+import { orders, tickets, ticketTypes, organizations } from '../db/schema.js';
 import { constructWebhookEvent } from '../services/stripe.js';
 
 const app = new Hono();
@@ -32,22 +32,25 @@ app.post('/stripe', async (c) => {
         const orderId = session.metadata?.orderId;
         if (!orderId) break;
 
-        // Activate the order
-        await db
-          .update(orders)
-          .set({
-            status: 'complete',
-            stripePaymentIntentId: typeof session.payment_intent === 'string'
-              ? session.payment_intent
-              : null,
-          })
-          .where(eq(orders.id, orderId));
+        // Guarded pending→complete transition makes Stripe redeliveries no-ops.
+        await db.transaction(async (tx) => {
+          const [order] = await tx
+            .update(orders)
+            .set({
+              status: 'complete',
+              stripePaymentIntentId: typeof session.payment_intent === 'string'
+                ? session.payment_intent
+                : null,
+            })
+            .where(and(eq(orders.id, orderId), eq(orders.status, 'pending')))
+            .returning();
+          if (!order) return;
 
-        // Activate all tickets for this order
-        await db
-          .update(tickets)
-          .set({ status: 'active' })
-          .where(eq(tickets.orderId, orderId));
+          await tx
+            .update(tickets)
+            .set({ status: 'active' })
+            .where(and(eq(tickets.orderId, orderId), eq(tickets.status, 'pending')));
+        });
 
         console.log(`[Webhook] Order ${orderId} completed`);
         break;
@@ -58,17 +61,33 @@ app.post('/stripe', async (c) => {
         const orderId = session.metadata?.orderId;
         if (!orderId) break;
 
-        // Cancel the order
-        await db
-          .update(orders)
-          .set({ status: 'cancelled' })
-          .where(eq(orders.id, orderId));
+        await db.transaction(async (tx) => {
+          const [order] = await tx
+            .update(orders)
+            .set({ status: 'cancelled' })
+            .where(and(eq(orders.id, orderId), eq(orders.status, 'pending')))
+            .returning();
+          if (!order) return;
 
-        // Cancel all tickets for this order
-        await db
-          .update(tickets)
-          .set({ status: 'cancelled' })
-          .where(eq(tickets.orderId, orderId));
+          const cancelled = await tx
+            .update(tickets)
+            .set({ status: 'cancelled' })
+            .where(and(eq(tickets.orderId, orderId), eq(tickets.status, 'pending')))
+            .returning({ ticketTypeId: tickets.ticketTypeId });
+
+          // Release the seats the pending order was holding — without this,
+          // abandoned checkouts permanently eat capacity.
+          const byType = new Map<string, number>();
+          for (const t of cancelled) {
+            if (t.ticketTypeId) byType.set(t.ticketTypeId, (byType.get(t.ticketTypeId) ?? 0) + 1);
+          }
+          for (const [ticketTypeId, count] of byType) {
+            await tx
+              .update(ticketTypes)
+              .set({ soldCount: sql`GREATEST(${ticketTypes.soldCount} - ${count}, 0)` })
+              .where(eq(ticketTypes.id, ticketTypeId));
+          }
+        });
 
         console.log(`[Webhook] Order ${orderId} expired/cancelled`);
         break;

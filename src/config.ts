@@ -11,9 +11,11 @@ export const config = {
     webhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
   },
   jwt: {
-    secret: process.env.JWT_SECRET || '',
-    issuer: process.env.JWT_ISSUER || 'pulsify-issuer',
-    audience: process.env.JWT_AUDIENCE || 'pulsify-audience',
-    algorithm: (process.env.JWT_ALGORITHM || 'HS512') as jwt.Algorithm,
+    secret: process.env.SUPABASE_JWT_SECRET || process.env.JWT_SECRET || '',
+    issuer:
+      process.env.JWT_ISSUER ||
+      (process.env.SUPABASE_URL ? `${process.env.SUPABASE_URL}/auth/v1` : 'pulsify-issuer'),
+    audience: process.env.JWT_AUDIENCE || 'authenticated',
+    algorithm: (process.env.JWT_ALGORITHM || 'HS256') as jwt.Algorithm,
   },
 } as const;

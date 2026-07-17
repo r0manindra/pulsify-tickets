@@ -60,6 +60,9 @@ export async function createCheckoutSession(params: {
 }) {
   return stripe.checkout.sessions.create({
     mode: 'payment',
+    // 30 min (Stripe's minimum) instead of the 24h default: the register flow
+    // reserves seats up front, and the expired-session webhook is what frees them.
+    expires_at: Math.floor(Date.now() / 1000) + 30 * 60,
     line_items: params.lineItems,
     payment_intent_data: {
       application_fee_amount: params.platformFeeAmount,
